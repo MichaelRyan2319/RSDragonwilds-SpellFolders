@@ -823,8 +823,6 @@ local function CloseFolder(why)
     U.DebugLog("Closed %s (%s).", view.folder.name, tostring(why))
 end
 
--- Opens the game's spell radial the way its own key does. (OpenWidgetIfClosed does nothing
--- for the radial; ToggleWidget opens it.)
 -- The Spellbook was opened while a folder was open in the radial: keep the folder open
 -- there, on the page the Spellbook shows, so it can be arranged.
 local function MoveViewToSpellbook(view, screen)
@@ -848,6 +846,8 @@ local function MoveViewToSpellbook(view, screen)
     return true
 end
 
+-- Opens the game's spell radial the way its own key does (ToggleWidget makes the radial
+-- start exactly as a press of the key does).
 local function OpenRadial()
     local api, pc = MenuApi(), U.PlayerController()
     if api and pc and not IsOpen(WIDGET_RADIAL) then U.Call(api, "ToggleWidget", pc, WIDGET_RADIAL, false, true) end
