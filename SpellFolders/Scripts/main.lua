@@ -8,10 +8,11 @@
         radial slot like a spell.
       * Pick a folder in the radial and the radial opens again showing the folder's
         spells. Pick one and the game casts it.
-      * In the Spellbook, right-click a folder in the radial to open it. The radial then
-        shows the folder's spells and you arrange them like any page: drag spells in
-        from the list, drag them between slots, remove them. Right-click again to go
+      * In the Spellbook, point at a folder in the radial and press O to open it. The
+        radial then shows the folder's spells and you arrange them like any page: drag
+        spells in from the list, drag them between slots, remove them. O again goes
         back. Dropping a spell from the list onto a closed folder adds it too.
+        (Opening the Spellbook from an open folder's radial shows that folder as well.)
 
     How it fits into the game:
       * A folder is a copy of one of the game's spells with no effect of its own. When
@@ -58,7 +59,10 @@ local PER_PAGE = 12          -- slots on one page of the game's radial
 local WIDGET_RADIAL = 21     -- EWidgetType::Spellcasting (the radial on the HUD)
 local WIDGET_SPELLBOOK = 20  -- EWidgetType::SpellBook
 
--- Pictures a folder can have (I in an open folder in the Spellbook steps through them).
+-- Keys in the Spellbook (names from UE4SS's Key table).
+local KEY_OPEN, KEY_RENAME, KEY_PICTURE = "O", "R", "I"
+
+-- Pictures a folder can have (KEY_PICTURE in an open folder in the Spellbook steps through them).
 local TOMES = "/Game/Art/UI/Icons/Skill_Tomes_Concept_Art/"
 local ICONS = {
     TOMES .. "T_Icon_Skill_Tome_Magic",
@@ -219,7 +223,7 @@ local function FolderDescription(folder)
         if spell then names[#names + 1] = SpellName(spell) end
     end
     local text = "A folder of spells. Pick it in the radial to open it. " ..
-                 "In the Spellbook, right-click it to open it and arrange its spells."
+                 "In the Spellbook, point at it and press " .. KEY_OPEN .. " to open it and arrange its spells."
     if #names > 0 then
         text = text .. " Holds: " .. table.concat(names, ", ") .. "."
     else
@@ -251,6 +255,11 @@ local function CreateFolder(i, template)
     U.Set(spell, "SpecialRequirementsStrategy", nil)
     U.Set(spell, "bNeedsUnlocking", true)
     U.Set(spell, "CastType", 0)
+    -- No skill tag (the base spell's little pickaxe) next to the folder's picture.
+    pcall(function()
+        local lib = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+        spell.SpellTagIcon = lib:Conv_SoftObjPathToSoftObjRef(lib:MakeSoftObjectPath(""))
+    end)
 
     local perkTemplate = U.Get(template, "OwningPerk")
     if U.Valid(perkTemplate) then
@@ -420,8 +429,9 @@ local menuApi
 local function MenuApi()
     if U.Valid(menuApi) then return menuApi end
     menuApi = nil
+    -- (It lives inside the world, under /Game/Maps, so IsTemplate would wrongly skip it.)
     for _, a in ipairs(FindAllOf("InputManagerUIAPI") or {}) do
-        if U.Valid(a) and not IsTemplate(a) then menuApi = a end
+        if U.Valid(a) and not U.FullName(a):find("Default__", 1, true) then menuApi = a end
     end
     return menuApi
 end
@@ -710,11 +720,8 @@ local function TitleLabels(radial)
     return list
 end
 
--- Where the hint line goes in the Spellbook: under the radial, left of the game's own
--- "Remove Spell / Back" line (measured from the screen centre, in interface units).
-local BOOK_HINT_X, BOOK_HINT_Y = 334, 432
-
--- Shows the open folder's name where the radial shows its page name.
+-- Shows the open folder's name where the radial shows its page name. In the Spellbook,
+-- the text in the middle of the radial ("Drag spell into the spellbook") lists the keys.
 local function ShowTitle(view)
     local radial
     if view.context == "hud" then
@@ -722,7 +729,16 @@ local function ShowTitle(view)
     else
         local screen = OpenSpellbook()
         radial = screen and U.Get(screen, "RadialSpellSelector")
-        UI.Hint("Right-click: close the folder     R: rename     I: change its picture", BOOK_HINT_X, BOOK_HINT_Y)
+        local info = U.Valid(radial) and U.Get(radial, "AssignInfoTextBlock")
+        if U.Valid(info) then
+            local ok, text = pcall(function() return info:GetText():ToString() end)
+            if ok then
+                view.info = { widget = info, text = text }
+                pcall(function()
+                    info:SetText(FText(KEY_OPEN .. ": close folder\n" .. KEY_RENAME .. ": rename\n" .. KEY_PICTURE .. ": picture"))
+                end)
+            end
+        end
     end
     view.titles = {}
     for _, t in ipairs(TitleLabels(radial)) do
@@ -735,7 +751,11 @@ local function ShowTitle(view)
 end
 
 local function RestoreTitle(view)
-    UI.Hint(nil)
+    if view.info then
+        local widget, text = view.info.widget, view.info.text
+        if U.Valid(widget) then pcall(function() widget:SetText(FText(text)) end) end
+        view.info = nil
+    end
     for _, title in ipairs(view.titles or {}) do
         local widget, text = title.widget, title.text
         if U.Valid(widget) then pcall(function() widget:SetText(FText(text)) end) end
@@ -791,9 +811,34 @@ local function CloseFolder(why)
     U.DebugLog("Closed %s (%s).", view.folder.name, tostring(why))
 end
 
+-- Opens the game's spell radial the way its own key does. (OpenWidgetIfClosed does nothing
+-- for the radial; ToggleWidget opens it.)
+-- The Spellbook was opened while a folder was open in the radial: keep the folder open
+-- there, on the page the Spellbook shows, so it can be arranged.
+local function MoveViewToSpellbook(view, screen)
+    local arr = SelectedSpells()
+    local shown = BookState(screen)
+    if not arr then return false end
+    local keep = view.pages[1]
+    for _, p in ipairs(view.pages) do
+        if p.page == shown then keep = p end
+    end
+    for _, p in ipairs(view.pages) do
+        if p ~= keep then WritePage(arr, p.page, p.original) end
+    end
+    RestoreTitle(view)
+    view.pages = { keep }
+    view.context = "book"
+    SaveState()
+    RefreshRadials()
+    ShowTitle(view)
+    U.DebugLog("%s stays open in the Spellbook (page %d).", view.folder.name, keep.page + 1)
+    return true
+end
+
 local function OpenRadial()
     local api, pc = MenuApi(), U.PlayerController()
-    if api and pc then U.Call(api, "OpenWidgetIfClosed", pc, WIDGET_RADIAL, false, true) end
+    if api and pc and not IsOpen(WIDGET_RADIAL) then U.Call(api, "ToggleWidget", pc, WIDGET_RADIAL, false, true) end
 end
 
 -- Runs often while a folder is open.
@@ -809,14 +854,22 @@ local function UpdateView(slow)
                 RefreshRadials()
             elseif now - view.at > 2.5 then
                 CloseFolder("the radial didn't open")
-            elseif now - view.at > 0.2 then
+            elseif now - view.at > 0.2 and now - (view.asked or 0) > 0.6 then
+                view.asked = now
                 OpenRadial()
             end
         elseif open then
             view.closed = nil
         else
             view.closed = view.closed or now
-            if now - view.closed > 0.15 and not Placing() then CloseFolder("radial closed") end
+            local screen = OpenSpellbook()
+            if screen then
+                MoveViewToSpellbook(view, screen)
+            elseif IsOpen(WIDGET_SPELLBOOK) and now - view.closed < 2 then
+                -- the Spellbook is on its way up
+            elseif now - view.closed > 0.15 and not Placing() then
+                CloseFolder("radial closed")
+            end
         end
     else
         local screen = OpenSpellbook()
@@ -868,7 +921,8 @@ local function UpdateCasts()
                     elseif View or not arr then
                         U.DebugLog("Folder cast ignored: another folder is open.")
                     elseif FolderCount(folder) == 0 then
-                        UI.Toast(folder.name .. " is empty. In the Spellbook (P), right-click it to open it, then drag spells in.", 5)
+                        UI.Toast(folder.name .. " is empty. In the Spellbook (P), point at it and press " .. KEY_OPEN ..
+                                 " to open it, then drag spells in.", 5)
                     else
                         -- The folder was picked from the page the player is on; open it on
                         -- every page that holds it, so that page is certainly one of them.
@@ -961,7 +1015,7 @@ end
 ------------------------------------------------------------------------ keys
 
 -- Set by the key binds (which UE4SS runs outside the game thread) and read by Tick.
-local Pressed = { RIGHT_MOUSE_BUTTON = false, R = false, I = false, ESCAPE = false, RETURN = false }
+local Pressed = { [KEY_OPEN] = false, [KEY_RENAME] = false, [KEY_PICTURE] = false, ESCAPE = false, RETURN = false }
 
 local function RenameFolder(folder)
     -- Typing needs the game's menus out of the way: close the Spellbook, ask, open it again.
@@ -987,31 +1041,38 @@ local function RenameFolder(folder)
     })
 end
 
--- Right-click in the Spellbook: opens the folder under the mouse, or closes the open one.
-local function OnRightClick()
+-- The open key in the Spellbook: opens the folder under the mouse, or closes the open one.
+-- (Not a right-click: the game removes a spell from its slot on a right-click.)
+local function OnOpenKey()
     local screen = OpenSpellbook()
-    if not screen or UI.IsOpen() then return end
+    if not screen then return end
     if View then
-        if View.context == "book" then CloseFolder("right-click") end
+        if View.context == "book" then CloseFolder("key") end
         return
     end
     local page, slice = BookState(screen)
     local arr = SelectedSpells()
-    if not (arr and page and slice) then return end
-    local current = arr[page * PER_PAGE + slice + 1]
+    local current = arr and page and slice and arr[page * PER_PAGE + slice + 1]
     local folder = U.Valid(current) and ByAddress[U.Addr(current)]
-    if folder then OpenFolder(folder, { page }, "book") end
+    if folder then
+        OpenFolder(folder, { page }, "book")
+    else
+        UI.Toast("Point at a folder in the radial, then press " .. KEY_OPEN .. " to open it.", 3)
+    end
 end
 
 local function UpdateKeys()
-    local right, r, i = Pressed.RIGHT_MOUSE_BUTTON, Pressed.R, Pressed.I
+    local open, r, i = Pressed[KEY_OPEN], Pressed[KEY_RENAME], Pressed[KEY_PICTURE]
     local esc, enter = Pressed.ESCAPE, Pressed.RETURN
-    Pressed.RIGHT_MOUSE_BUTTON, Pressed.R, Pressed.I, Pressed.ESCAPE, Pressed.RETURN = false, false, false, false, false
+    for name in pairs(Pressed) do Pressed[name] = false end
     if UI.IsOpen() then
         if esc then UI.Key("ESCAPE") elseif enter then UI.Key("RETURN") end
         return
     end
-    if right then OnRightClick() end
+    if open then
+        U.DebugLog("Key %s.", KEY_OPEN)
+        OnOpenKey()
+    end
     if View and View.context == "book" then
         local folder = View.folder
         if i then
@@ -1167,7 +1228,6 @@ end
 function SpellFoldersStop()
     if View then pcall(CloseFolder, "mod stopped") end
     stopped = true
-    UI.Hint(nil)
     UI.Close()
 end
 

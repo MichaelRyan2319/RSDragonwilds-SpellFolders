@@ -62,24 +62,30 @@ spell list down to **Spell Folders**. Drag a folder into a slot of the radial,
 like a spell. There are eight folders.
 
 **Fill and arrange a folder.** In the Spellbook, point at the folder in the
-radial and **right-click**. The radial now shows the folder's spells, and its
-title shows the folder's name. Arrange it like any page:
+radial and press **O**. The radial now shows the folder's spells, and its title
+shows the folder's name. Arrange it like any page:
 
 - drag spells in from the list;
 - drag spells from one slot to another;
 - remove a spell the way you remove one from a normal page.
 
-**Right-click** again to close the folder. It also closes when you change page
-or leave the Spellbook. While a folder is open:
+Press **O** again to close the folder. It also closes when you change page or
+leave the Spellbook. While a folder is open:
 
 - **I** changes the folder's picture (twelve book pictures);
 - **R** renames it. The Spellbook closes while you type and opens again after.
 
 A quicker way to add one spell: drag it from the list onto a closed folder.
 
+(Don't right-click a folder to open it: in the game, a right-click takes a
+spell out of its slot.)
+
 **Cast from a folder.** Press **Q**, pick the folder, and the radial opens again
 with the folder's spells. Pick a spell to cast it, or close the radial to cast
 nothing. Your normal page is back the next time you open the radial.
+
+Pressing **P** while a folder is open in the radial opens the Spellbook on that
+folder, ready to arrange.
 
 A folder can't hold another folder.
 

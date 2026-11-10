@@ -1,6 +1,5 @@
 -- Spell Folders: the few widgets the mod draws itself, built from plain UMG at run time.
 --   UI.Toast(text, seconds)   short message at the top of the screen
---   UI.Hint(text, x, y)       a line of text that stays until UI.Hint(nil)
 --   UI.Prompt(spec)           text box (naming a folder)
 -- UI.Tick() must be called often (about every 50 ms) on the game thread, and UI.Key(name)
 -- when Enter or Esc is pressed while a prompt is open.
@@ -11,17 +10,14 @@ local U = require("folders.util")
 local UI = {}
 local active = nil      -- the open Prompt
 local toasts = {}
-local hint = nil
 
 local WHITE = { R = 1, G = 1, B = 1, A = 1 }
 local GOLD = { R = 0.93, G = 0.78, B = 0.45, A = 1 }
 local GREY = { R = 0.7, G = 0.7, B = 0.7, A = 1 }
-local CREAM = { R = 0.88, G = 0.84, B = 0.79, A = 1 }   -- the game's menu text
-local FONT_TEXT = "/Game/UI/Fonts/Poppins-Regular_Font"
 
--- The game's menus (Spellbook, inventory) are drawn above ordinary viewport widgets;
--- these go above the menus.
-local Z_TOP = 5000
+-- The game's menus (Spellbook, inventory) are drawn above ordinary viewport widgets.
+-- This is as far up as a viewport widget can ask to be.
+local Z_TOP = 2000000000
 local HIT_TEST_INVISIBLE = 3
 
 local function New(classPath, outer, name)
@@ -123,36 +119,6 @@ function UI.Toast(message, seconds)
     end)
     if not ok then U.Log("Toast failed: %s (%s)", tostring(err), tostring(message)) end
     U.Log("%s", message)
-end
-
--------------------------------------------------------------------- hint
-
--- A line of text in the game's menu font at (x, y) from the screen centre, until UI.Hint(nil).
-function UI.Hint(text, x, y)
-    if hint then
-        Remove(hint.widget)
-        hint = nil
-    end
-    if not text or text == "" then return end
-    local ok, err = pcall(function()
-        local w, canvas = Root("Hint")
-        local t = Text(w.WidgetTree, text, 11, CREAM, 1)
-        pcall(function()
-            local font = t.Font
-            local obj = U.Load(FONT_TEXT)
-            if obj then
-                font.FontObject = obj
-                font.TypefaceFontName = FName("Default")
-            end
-            font.Size = 11
-            t:SetFont(font)
-        end)
-        Place(canvas, t, x or 0, y or 0, nil, nil, 0.5, 0.5)
-        pcall(function() w:SetVisibility(HIT_TEST_INVISIBLE) end)
-        w:AddToViewport(Z_TOP)
-        hint = { widget = w }
-    end)
-    if not ok then U.Log("Hint failed: %s", tostring(err)) end
 end
 
 -------------------------------------------------------------------- prompt
