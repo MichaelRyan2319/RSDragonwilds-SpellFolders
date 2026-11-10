@@ -443,18 +443,18 @@ local function IsOpen(widgetType)
     return ok and open == true
 end
 
--- The game's spell radial on the HUD (not the copy inside the Spellbook).
-local hudRadial
+-- The game's spell radial on the HUD (not the copy inside the Spellbook), and its panel.
+local hudRadial, hudPanel
 local function HudRadial()
-    if U.Valid(hudRadial) then return hudRadial end
-    hudRadial = nil
+    if U.Valid(hudRadial) and U.Valid(hudPanel) then return hudRadial, hudPanel end
+    hudRadial, hudPanel = nil, nil
     for _, panel in ipairs(FindAllOf("SpellcastingMainPanel") or {}) do
         if U.Valid(panel) and not IsTemplate(panel) then
             local radial = U.Get(panel, "SpellRadialWidget")
-            if U.Valid(radial) then hudRadial = radial end
+            if U.Valid(radial) then hudRadial, hudPanel = radial, panel end
         end
     end
-    return hudRadial
+    return hudRadial, hudPanel
 end
 
 -- The open Spellbook screen, if any.
@@ -775,6 +775,8 @@ local function RestoreTitle(view)
     view.titles = nil
 end
 
+local NormalFade   -- defined with OpenRadial below
+
 -- Opens a folder: its spells replace the given radial pages until CloseFolder.
 local function OpenFolder(folder, pages, context)
     local arr = SelectedSpells()
@@ -807,6 +809,7 @@ local function CloseFolder(why)
     local view = View
     if not view then return end
     View = nil
+    if view.fast then NormalFade(view) end
     RestoreTitle(view)
     local arr = SelectedSpells()
     if arr then
@@ -848,9 +851,26 @@ end
 
 -- Opens the game's spell radial the way its own key does (ToggleWidget makes the radial
 -- start exactly as a press of the key does).
-local function OpenRadial()
+-- This runs within a frame of the folder being picked, when the radial has only just begun
+-- to fade out. Its quarter-second fade-in is hurried along so the folder's spells are
+-- there at once, and no slot starts out highlighted, so a second click that was already
+-- on its way (a double-click on the folder) picks nothing.
+local FADE_SPEED = 8.0
+local function OpenRadial(view)
     local api, pc = MenuApi(), U.PlayerController()
-    if api and pc and not IsOpen(WIDGET_RADIAL) then U.Call(api, "ToggleWidget", pc, WIDGET_RADIAL, false, true) end
+    if not (api and pc) or IsOpen(WIDGET_RADIAL) then return end
+    U.Call(api, "ToggleWidget", pc, WIDGET_RADIAL, false, true)
+    local radial, panel = HudRadial()
+    local anim = U.Valid(panel) and U.Get(panel, "InAnimation")
+    if U.Valid(anim) and U.Call(panel, "SetPlaybackSpeed", anim, FADE_SPEED) then view.fast = true end
+    if U.Valid(radial) then U.Set(radial, "CachedSectionId", 255) end
+end
+
+NormalFade = function(view)
+    view.fast = nil
+    local _, panel = HudRadial()
+    local anim = U.Valid(panel) and U.Get(panel, "InAnimation")
+    if U.Valid(anim) then U.Call(panel, "SetPlaybackSpeed", anim, 1.0) end
 end
 
 -- Runs often while a folder is open.
@@ -866,12 +886,13 @@ local function UpdateView(slow)
                 RefreshRadials()
             elseif now - view.at > 2.5 then
                 CloseFolder("the radial didn't open")
-            elseif now - view.at > 0.2 and now - (view.asked or 0) > 0.6 then
+            elseif now - (view.asked or 0) > 0.3 then
                 view.asked = now
-                OpenRadial()
+                OpenRadial(view)
             end
         elseif open then
             view.closed = nil
+            if view.fast and now - view.opened > 0.5 then NormalFade(view) end
         else
             view.closed = view.closed or now
             local screen = OpenSpellbook()
@@ -1146,17 +1167,28 @@ end
 
 ------------------------------------------------------------------------ driving
 
+-- The tick runs about once a frame so that a picked folder is back on screen at once.
+-- Everything that isn't urgent runs on every SLOW_EVERY-th tick (about four times a second).
+local TICK_MS = 16
+local SLOW_EVERY = 15
 local tickCount = 0
 local worldReady = false
 local function Tick()
     if stopped then return end
     tickCount = tickCount + 1
-    local slow = tickCount % 5 == 0
+    local slow = tickCount % SLOW_EVERY == 0
     UI.Tick()
     if not Ready then return end
     if slow then
         worldReady = UpdateWorld()
-        if not hooked and tickCount % 100 == 0 then HookPlacement() end
+        if not hooked and tickCount % (SLOW_EVERY * 20) == 0 then HookPlacement() end
+        -- Development: with DebugLogging on, a file named stop.txt in the mod folder stops
+        -- this copy of the mod (so another copy can be run without restarting the game).
+        if U.Debug and tickCount % (SLOW_EVERY * 4) == 0 and U.ReadFile(MOD_FOLDER .. "stop.txt") then
+            U.Log("stop.txt found: this copy of the mod stops.")
+            SpellFoldersStop()
+            return
+        end
     end
     if not worldReady then return end
     UpdateKeys()
@@ -1189,7 +1221,7 @@ local function TryStart()
 end
 
 local started = false
-U.GameThreadLoop(50, function()
+U.GameThreadLoop(TICK_MS, function()
     if not started then
         local ok, res = pcall(TryStart)
         if not ok then
