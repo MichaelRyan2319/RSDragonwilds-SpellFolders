@@ -2,21 +2,24 @@
     Spell Folders - RuneScape: Dragonwilds (UE4SS Lua mod)
 
     Adds folders to the spell system. A folder sits in one slot of the spell radial (Q)
-    and holds up to 12 spells. Casting the folder opens a second wheel, drawn like the
-    game's own, where you pick the spell to cast.
+    and holds up to 12 spells of its own, laid out like a page of the radial.
 
       * Folders are listed in the Spellbook (P) under "Spell Folders". Drag one into a
         radial slot like a spell.
-      * To put a spell into a folder, drag it from the Spellbook list onto the folder
-        in the radial.
-      * In a folder's wheel: left click casts, right click takes the spell out of the
-        folder, R renames the folder, I changes its picture.
+      * Pick a folder in the radial and the radial opens again showing the folder's
+        spells. Pick one and the game casts it.
+      * In the Spellbook, right-click a folder in the radial to open it. The radial then
+        shows the folder's spells and you arrange them like any page: drag spells in
+        from the list, drag them between slots, remove them. Right-click again to go
+        back. Dropping a spell from the list onto a closed folder adds it too.
 
     How it fits into the game:
       * A folder is a copy of one of the game's spells with no effect of its own. When
-        the game starts casting it, the mod stops that cast and opens the wheel.
-      * The spell you pick is cast by the game itself, through its own radial, so rune
-        costs, cooldowns, aiming and placing all work as they do from the radial.
+        the game starts casting it, the mod stops that cast and opens the folder.
+      * An open folder is shown by the game's own radial: for as long as it is open,
+        the mod puts the folder's spells into the radial page the folder is on, and
+        puts the page back afterwards. Picking, casting, rune costs, cooldowns, aiming
+        and placing are all the game's own.
       * Saves only ever contain IDs the game knows. A folder borrows the save ID of an
         always-available spell (Siphon Runes), and the mod keeps the folders and the
         slots they are in in its own file (saved_<character>.txt). Removing the mod can
@@ -51,9 +54,11 @@ U.Debug = Config.DebugLogging == true
 Config.Folders = math.max(1, math.min(24, math.floor(tonumber(Config.Folders) or Defaults.Folders)))
 
 local MOD_FOLDER = U.ModFolder()
-local MAX_SPELLS = UI.MaxOptions   -- a folder's wheel has 12 slots, like a page of the game's radial
+local PER_PAGE = 12          -- slots on one page of the game's radial
+local WIDGET_RADIAL = 21     -- EWidgetType::Spellcasting (the radial on the HUD)
+local WIDGET_SPELLBOOK = 20  -- EWidgetType::SpellBook
 
--- Pictures a folder can have (I in the folder's wheel steps through them).
+-- Pictures a folder can have (I in an open folder in the Spellbook steps through them).
 local TOMES = "/Game/Art/UI/Icons/Skill_Tomes_Concept_Art/"
 local ICONS = {
     TOMES .. "T_Icon_Skill_Tome_Magic",
@@ -67,7 +72,7 @@ local ICONS = {
     TOMES .. "T_Icon_Skill_Tome_Ranged",
     TOMES .. "T_Icon_Skill_Tome_Artisan",
     TOMES .. "T_Icon_Skill_Tome_Fishing",
-    "/Game/Art/UI/Icons/Skill_Tomes_Concept_Art/T_Icon_Tome_of_the_Dragon_Slayer",
+    TOMES .. "T_Icon_Tome_of_the_Dragon_Slayer",
 }
 
 -- Spell modules kept from the base spell. Everything else (the base spell's effect) is removed.
@@ -80,11 +85,12 @@ local KEEP_MODULES = {
 
 ------------------------------------------------------------------------ state
 
-local Folders = {}       -- index -> { index, object, perk, name, icon, spells = { key, ... } }
+local Folders = {}       -- index -> { index, object, perk, name, icon, slots = { [0..11] = spell key } }
 local ByAddress = {}     -- address of a folder's game object -> folder
 local AliasId = nil      -- persistence ID borrowed from the alias spell
 local AliasAddr = nil    -- address of the alias spell itself
 local Ready = false      -- folder objects created
+local stopped = false    -- this copy of the mod was told to stop (a newer copy runs)
 
 local World = {
     pawnAddr = nil,
@@ -93,7 +99,13 @@ local World = {
     file = nil,
     slots = {},          -- radial slot (0-based, all pages) -> folder index
     cleanUntil = nil,
+    pending = nil,       -- pages an open folder had replaced when the file was last read: page -> { [0..11] = key }
 }
+
+-- The open folder, if any:
+-- { folder, context = "hud" | "book", pages = { { page, original = { [k] = object } } },
+--   unresolved = { [k] = key }, at, opened, closed }
+local View = nil
 
 local function DefaultName(i) return "Folder " .. i end
 local function DefaultIcon(i) return (i - 1) % #ICONS + 1 end
@@ -127,6 +139,7 @@ local function RefreshSpellIndex(force)
 end
 
 local function FindSpell(key)
+    if not key then return nil end
     local spell = SpellIndex[key]
     if U.Valid(spell) then return spell end
     RefreshSpellIndex(false)
@@ -148,52 +161,29 @@ local function Modules(spell)
     return list, arr
 end
 
--- The player's main bag (BP_Components_Inventory on the player controller).
-local function Bag()
-    local pc = U.PlayerController()
-    if not pc then return nil end
-    local addr = U.Addr(pc)
-    for _, c in ipairs(FindAllOf("InventoryComponent") or {}) do
-        if U.Valid(c) and U.Name(c) == "BP_Components_Inventory" then
-            local ok, owner = pcall(function() return c:GetOwner() end)
-            if ok and U.Addr(owner) == addr then return c end
-        end
+------------------------------------------------------------------------ folders
+
+local function FolderCount(folder)
+    local n = 0
+    for k = 0, PER_PAGE - 1 do
+        if folder.slots[k] then n = n + 1 end
+    end
+    return n
+end
+
+local function FolderHas(folder, key)
+    for k = 0, PER_PAGE - 1 do
+        if folder.slots[k] == key then return true end
+    end
+    return false
+end
+
+local function FirstFree(folder)
+    for k = 0, PER_PAGE - 1 do
+        if not folder.slots[k] then return k end
     end
     return nil
 end
-
--- What the folder wheel shows for a spell: name, picture, rune cost, cooldown, description.
-local function SpellInfo(spell, bag)
-    local info = { name = SpellName(spell), cost = {}, cooldown = U.Get(spell, "CooldownDuration") or 0 }
-    local icon = U.SoftToString(U.Get(spell, "SpellIcon"))
-    info.icon = icon ~= "" and icon or nil
-    local perk = U.Get(spell, "OwningPerk")
-    info.description = U.Valid(perk) and U.Str(U.Get(perk, "PerkDescription")) or ""
-    for _, m in ipairs(Modules(spell)) do
-        if m.class == "SpellModule_CostItems" then
-            local costs = U.Get(m.module, "ItemsCostInfo")
-            for i = 1, (costs and costs:GetArrayNum() or 0) do
-                local item = U.Get(costs[i], "ItemData")
-                local count = U.Get(costs[i], "Count") or 0
-                if U.Valid(item) and count > 0 then
-                    local itemIcon = U.SoftToString(U.Get(item, "Icon"))
-                    local have = nil
-                    if bag then
-                        local ok, n = U.Call(bag, "GetNumItemsByData", item)
-                        if ok and type(n) == "number" then have = n end
-                    end
-                    local missing = have ~= nil and have < count
-                    info.cost[#info.cost + 1] = { icon = itemIcon ~= "" and itemIcon or nil, count = count,
-                                                  name = U.Str(U.Get(item, "Name")), missing = missing }
-                    if missing and not info.missing then info.missing = U.Str(U.Get(item, "Name")) end
-                end
-            end
-        end
-    end
-    return info
-end
-
------------------------------------------------------------------------- creating the folders
 
 local function StripModules(spell)
     local list, arr = Modules(spell)
@@ -224,13 +214,17 @@ end
 
 local function FolderDescription(folder)
     local names = {}
-    for _, key in ipairs(folder.spells) do
-        local spell = FindSpell(key)
+    for k = 0, PER_PAGE - 1 do
+        local spell = FindSpell(folder.slots[k])
         if spell then names[#names + 1] = SpellName(spell) end
     end
-    local text = "A folder of spells. Cast it to open it, then pick a spell. " ..
-                 "To add a spell, drag it from the Spellbook list onto the folder in the radial."
-    if #names > 0 then text = text .. " Holds: " .. table.concat(names, ", ") .. "." end
+    local text = "A folder of spells. Pick it in the radial to open it. " ..
+                 "In the Spellbook, right-click it to open it and arrange its spells."
+    if #names > 0 then
+        text = text .. " Holds: " .. table.concat(names, ", ") .. "."
+    else
+        text = text .. " Empty."
+    end
     return text
 end
 
@@ -249,7 +243,7 @@ end
 local function CreateFolder(i, template)
     local spell = U.Clone(template, nil, "USD_SpellFolder_" .. i)
     if not spell then return nil end
-    local folder = { index = i, object = spell, name = DefaultName(i), icon = DefaultIcon(i), spells = {} }
+    local folder = { index = i, object = spell, name = DefaultName(i), icon = DefaultIcon(i), slots = {} }
     StripModules(spell)
     U.Set(spell, "PersistenceID", AliasId)
     U.Set(spell, "InternalName", "spellfolder_" .. i)
@@ -334,7 +328,7 @@ end
 local function SaveState()
     if not World.file then return end
     local lines = { "# Spell Folders: your folders and the radial slots they are in. Written by the mod.",
-                    "# format 1" }
+                    "# format 2" }
     local keys = {}
     for slot in pairs(World.slots) do keys[#keys + 1] = slot end
     table.sort(keys)
@@ -342,82 +336,183 @@ local function SaveState()
     for i, folder in ipairs(Folders) do
         if folder.name ~= DefaultName(i) then lines[#lines + 1] = "folder " .. i .. " name=" .. folder.name end
         if folder.icon ~= DefaultIcon(i) then lines[#lines + 1] = "folder " .. i .. " icon=" .. folder.icon end
-        for _, key in ipairs(folder.spells) do lines[#lines + 1] = "folder " .. i .. " spell=" .. key end
+        for k = 0, PER_PAGE - 1 do
+            if folder.slots[k] then lines[#lines + 1] = "folder " .. i .. " at " .. k .. "=" .. folder.slots[k] end
+        end
+    end
+    -- While a folder is open, its spells sit in a radial page. If the game stops before the
+    -- folder closes, the next load puts these pages back.
+    if View then
+        for _, p in ipairs(View.pages) do
+            local parts = {}
+            for k = 0, PER_PAGE - 1 do
+                local object = p.original[k]
+                parts[#parts + 1] = U.Valid(object) and KeyOf(object) or ""
+            end
+            lines[#lines + 1] = "open page " .. p.page .. "=" .. table.concat(parts, "|")
+        end
     end
     U.WriteFile(World.file, table.concat(lines, "\n") .. "\n")
 end
 
 -- Reads the saved file into the folders (every folder is reset first, so a character
--- without a file starts with empty folders).
+-- without a file starts with empty folders). Returns the folder slots and the pages an
+-- open folder had replaced.
 local function LoadState(path)
-    local slots = {}
+    local slots, pending = {}, nil
     for i, folder in ipairs(Folders) do
-        folder.name, folder.icon, folder.spells = DefaultName(i), DefaultIcon(i), {}
+        folder.name, folder.icon, folder.slots = DefaultName(i), DefaultIcon(i), {}
     end
     local text = U.ReadFile(path) or ""
     for line in text:gmatch("[^\r\n]+") do
         local slot, idx = line:match("^slot (%d+)=(%d+)$")
+        local page, keys = line:match("^open page (%d+)=(.*)$")
         if slot then
             if Folders[tonumber(idx)] then slots[tonumber(slot)] = tonumber(idx) end
+        elseif page then
+            local list, k = {}, 0
+            for key in (keys .. "|"):gmatch("([^|]*)|") do
+                if key ~= "" and k < PER_PAGE then list[k] = key end
+                k = k + 1
+            end
+            pending = pending or {}
+            pending[tonumber(page)] = list
         else
             local i, field, value = line:match("^folder (%d+) (%a+)=(.*)$")
+            local at, key
+            if not i then
+                i, at, key = line:match("^folder (%d+) at (%d+)=(.+)$")
+            end
             local folder = i and Folders[tonumber(i)]
-            if folder then
+            if folder and at then
+                if tonumber(at) < PER_PAGE then folder.slots[tonumber(at)] = key end
+            elseif folder then
                 if field == "name" and value ~= "" then
                     folder.name = value
                 elseif field == "icon" and ICONS[tonumber(value) or 0] then
                     folder.icon = tonumber(value)
-                elseif field == "spell" and value ~= "" and #folder.spells < MAX_SPELLS then
-                    folder.spells[#folder.spells + 1] = value
+                elseif field == "spell" and value ~= "" then
+                    -- format 1: a plain list
+                    local free = FirstFree(folder)
+                    if free then folder.slots[free] = value end
                 end
             end
         end
     end
-    return slots
+    return slots, pending
 end
 
------------------------------------------------------------------------- the radial
+------------------------------------------------------------------------ the game's radial
 
-local function SpellcastingComponent()
-    return U.OwnedComponent("SpellcastingComponent", U.PlayerController())
+local function IsTemplate(obj)
+    local name = U.FullName(obj)
+    return name:find("Default__", 1, true) ~= nil or name:find("^%S+ /Game/") ~= nil
 end
 
 local function SelectedSpells()
-    local sc = SpellcastingComponent()
+    local sc = U.OwnedComponent("SpellcastingComponent", U.PlayerController())
     local arr = sc and U.Get(sc, "SelectedSpells")
     if not arr then return nil end
     return arr, sc
 end
 
--- Puts a spell (or nothing) into a radial slot and tells the game's interface.
-local function SetSlot(sc, arr, slot, spell)
-    pcall(function() arr[slot + 1] = spell end)
-    if spell then U.Call(sc, "Client_NotifySelectedSpell", spell, slot) end
-end
-
-local function SlotsHolding(arr, object)
-    local addr, list = U.Addr(object), {}
-    for i = 1, arr:GetArrayNum() do
-        local sp = arr[i]
-        if U.Valid(sp) and U.Addr(sp) == addr then list[#list + 1] = i - 1 end
+local menuApi
+local function MenuApi()
+    if U.Valid(menuApi) then return menuApi end
+    menuApi = nil
+    for _, a in ipairs(FindAllOf("InputManagerUIAPI") or {}) do
+        if U.Valid(a) and not IsTemplate(a) then menuApi = a end
     end
-    return list
+    return menuApi
 end
 
--- Shows a folder's changed name or picture wherever it sits in the radial.
-local function RefreshFolderSlots(folder)
-    local arr, sc = SelectedSpells()
-    if not arr then return end
-    for _, slot in ipairs(SlotsHolding(arr, folder.object)) do
-        U.Call(sc, "Client_NotifySelectedSpell", folder.object, slot)
+local function IsOpen(widgetType)
+    local api, pc = MenuApi(), U.PlayerController()
+    if not (api and pc) then return false end
+    local ok, open = pcall(function() return api:IsOpen(pc, widgetType) end)
+    return ok and open == true
+end
+
+-- The game's spell radial on the HUD (not the copy inside the Spellbook).
+local hudRadial
+local function HudRadial()
+    if U.Valid(hudRadial) then return hudRadial end
+    hudRadial = nil
+    for _, panel in ipairs(FindAllOf("SpellcastingMainPanel") or {}) do
+        if U.Valid(panel) and not IsTemplate(panel) then
+            local radial = U.Get(panel, "SpellRadialWidget")
+            if U.Valid(radial) then hudRadial = radial end
+        end
     end
+    return hudRadial
 end
 
-local function HasSpell(folder, key)
-    for i, k in ipairs(folder.spells) do
-        if k == key then return i end
+-- The open Spellbook screen, if any.
+local function OpenSpellbook()
+    for _, screen in ipairs(FindAllOf("SpellBookScreen") or {}) do
+        if U.Valid(screen) and not IsTemplate(screen) then
+            local ok, visible = pcall(function() return screen:IsVisible() end)
+            if ok and visible then return screen end
+        end
     end
     return nil
+end
+
+-- Which page the Spellbook's radial shows, and which slot the mouse is over (nil if none).
+local function BookState(screen)
+    local radial = U.Get(screen, "RadialSpellSelector")
+    if not U.Valid(radial) then return nil end
+    local page
+    pcall(function() page = radial.SpellbookSelector.RadioGroup:GetSelectedValue() end)
+    local slice = tonumber(U.Get(radial, "CachedSectionId"))
+    if slice and (slice < 0 or slice >= PER_PAGE) then slice = nil end
+    return tonumber(page), slice, radial
+end
+
+-- Makes the radials on screen show what the slots hold now.
+local function RefreshRadials()
+    if IsOpen(WIDGET_RADIAL) then
+        local radial = HudRadial()
+        if radial then U.Call(radial, "RefreshAllSlices") end
+    end
+    local screen = OpenSpellbook()
+    local radial = screen and U.Get(screen, "RadialSpellSelector")
+    if U.Valid(radial) then U.Call(radial, "RefreshAllSlices") end
+end
+
+local function SetSlot(arr, slot, spell)
+    pcall(function() arr[slot + 1] = spell end)
+end
+
+local function ReadPage(arr, page)
+    local objects = {}
+    for k = 0, PER_PAGE - 1 do
+        local current = arr[page * PER_PAGE + k + 1]
+        if U.Valid(current) then objects[k] = current end
+    end
+    return objects
+end
+
+local function WritePage(arr, page, objects)
+    for k = 0, PER_PAGE - 1 do
+        local object = objects[k]
+        SetSlot(arr, page * PER_PAGE + k, U.Valid(object) and object or nil)
+    end
+end
+
+local function PagesHolding(arr, object)
+    local addr, pages, seen = U.Addr(object), {}, {}
+    for i = 1, arr:GetArrayNum() do
+        local sp = arr[i]
+        if U.Valid(sp) and U.Addr(sp) == addr then
+            local page = (i - 1) // PER_PAGE
+            if not seen[page] then
+                seen[page] = true
+                pages[#pages + 1] = page
+            end
+        end
+    end
+    return pages
 end
 
 local function UnlockFolders()
@@ -432,17 +527,31 @@ local function UnlockFolders()
     return true
 end
 
--- Puts the folders back into the radial slots they were in last time. The save holds
--- the alias spell there.
+-- Puts back the pages a folder was open on when the game last stopped, then the folders
+-- themselves into the radial slots they were in. (The save holds the alias spell there.)
 local function RestoreSlots()
-    local arr, sc = SelectedSpells()
+    local arr = SelectedSpells()
     if not arr then return false end
     local n = arr:GetArrayNum()
+    if World.pending then
+        for page, keys in pairs(World.pending) do
+            if (page + 1) * PER_PAGE <= n then
+                local objects = {}
+                for k = 0, PER_PAGE - 1 do objects[k] = FindSpell(keys[k]) end
+                WritePage(arr, page, objects)
+            end
+        end
+        World.pending = nil
+        U.Log("A folder was open when the game last stopped; its radial page is back as it was.")
+    end
     for slot, idx in pairs(World.slots) do
         local folder = Folders[idx]
         if folder and slot < n then
             local current = arr[slot + 1]
-            if not U.Valid(current) or U.Addr(current) == AliasAddr then SetSlot(sc, arr, slot, folder.object) end
+            -- (Another folder there was put in by the game when the folders were unlocked.)
+            if not U.Valid(current) or U.Addr(current) == AliasAddr or ByAddress[U.Addr(current)] then
+                SetSlot(arr, slot, folder.object)
+            end
         end
     end
     return true
@@ -452,12 +561,12 @@ end
 -- the game) are dead objects now. Takes them out of the radial; RestoreSlots puts the
 -- new ones in.
 local function ClearStaleFolders()
-    local arr, sc = SelectedSpells()
+    local arr = SelectedSpells()
     if not arr then return end
     for i = 1, arr:GetArrayNum() do
         local sp = arr[i]
         if U.Valid(sp) and not ByAddress[U.Addr(sp)] and U.Str(U.Get(sp, "InternalName")):match("^spellfolder_%d+$") then
-            SetSlot(sc, arr, i - 1, nil)
+            SetSlot(arr, i - 1, nil)
         end
     end
 end
@@ -466,38 +575,23 @@ end
 -- folders are unlocked again on every load. This empties every slot that holds a folder
 -- the player didn't put there. Returns how many slots were emptied.
 local function CleanRadial()
-    local arr, sc = SelectedSpells()
+    local arr = SelectedSpells()
     if not arr then return 0 end
     local removed = 0
     for i = 1, arr:GetArrayNum() do
         local folder = ByAddress[U.Addr(arr[i])]
         if folder and World.slots[i - 1] ~= folder.index then
-            SetSlot(sc, arr, i - 1, nil)
+            SetSlot(arr, i - 1, nil)
             removed = removed + 1
         end
     end
+    if removed > 0 then RefreshRadials() end
     return removed
 end
 
------------------------------------------------------------------------- spellbook
+------------------------------------------------------------------------ spellbook category
 
 local Book = { entries = {} }   -- screen address -> our list entry
-
-local function IsTemplate(obj)
-    local name = U.FullName(obj)
-    return name:find("Default__", 1, true) ~= nil or name:find("^%S+ /Game/") ~= nil
-end
-
--- The open Spellbook screen, if any.
-local function OpenSpellbook()
-    for _, screen in ipairs(FindAllOf("SpellBookScreen") or {}) do
-        if U.Valid(screen) and not IsTemplate(screen) then
-            local ok, visible = pcall(function() return screen:IsVisible() end)
-            if ok and visible then return screen end
-        end
-    end
-    return nil
-end
 
 local function UpdateSpellbook()
     if not Ready or #Folders == 0 then return end
@@ -549,156 +643,203 @@ local function UpdateSpellbook()
     U.DebugLog("Added the %s category to the spellbook.", Config.CategoryName)
 end
 
------------------------------------------------------------------------- casting a spell from a folder
+------------------------------------------------------------------------ an open folder
 
--- The game's spell radial on the HUD (not the copy inside the Spellbook).
-local function HudRadial()
-    for _, panel in ipairs(FindAllOf("SpellcastingMainPanel") or {}) do
-        if U.Valid(panel) and not IsTemplate(panel) then
-            local radial = U.Get(panel, "SpellRadialWidget")
-            if U.Valid(radial) then return radial end
-        end
-    end
-    return nil
-end
-
--- Has the game cast `spell` exactly as if the player had picked it in the radial, so the
--- rune cost, cooldown, aiming and placing are all the game's own.
--- The radial's SelectSlice casts whatever is in the slot it last pointed at, on the page
--- the player is on. The spell is put into that slot on every page for the length of the
--- call, and what was there (the folder) is put back before anything else can run.
-local function CastSpell(spell)
-    local arr = SelectedSpells()
-    local radial = HudRadial()
-    if not (arr and radial and U.Valid(spell)) then return false end
-    local n = arr:GetArrayNum()
-    local perPage = 12
-    local slice = tonumber(U.Get(radial, "CachedSectionId")) or 0
-    if slice < 0 or slice >= perPage then
-        slice = 0
-        U.Set(radial, "CachedSectionId", 0)
-    end
-    local held = {}
-    local ok = pcall(function()
-        for slot = slice, n - 1, perPage do
-            local current = arr[slot + 1]
-            held[#held + 1] = { slot = slot, object = U.Valid(current) and current or nil }
-            arr[slot + 1] = spell
-        end
+-- While the player aims or places a spell, the game shows a placement actor. The page a
+-- folder borrowed is only given back once that is over.
+local placing, placingSince = 0, 0
+local hooked = false
+local function HookPlacement()
+    if hooked then return end
+    local ok1 = pcall(RegisterHook, "/Script/Dominion.SpellcastingComponent:Server_SpawnSpellPlacementVisualizer", function()
+        placing, placingSince = placing + 1, os.clock()
     end)
-    if ok then ok = U.Call(radial, "SelectSlice") end
-    for _, h in ipairs(held) do
-        local slot, object = h.slot, h.object
-        pcall(function() arr[slot + 1] = object end)
-    end
-    return ok
+    local ok2 = pcall(RegisterHook, "/Script/Dominion.SpellcastingComponent:Server_DespawnSpellPlacementVisualizer", function()
+        placing = math.max(0, placing - 1)
+    end)
+    hooked = ok1 and ok2
+    if hooked then U.DebugLog("Watching spell placement.") end
 end
 
------------------------------------------------------------------------- the folder's wheel
-
-local LastPick = {}     -- folder index -> option picked last time
-local OpenWheel         -- defined below; the wheel reopens itself after a change
-
-local function RemoveFromFolder(folder, key)
-    local at = HasSpell(folder, key)
-    if not at then return end
-    table.remove(folder.spells, at)
-    ApplyLook(folder)
-    SaveState()
+local function Placing()
+    if placing > 0 and os.clock() - placingSince > 120 then placing = 0 end
+    return placing > 0
 end
 
-local function RenameFolder(folder)
-    UI.Prompt({
-        title = "Name this folder",
-        hint = DefaultName(folder.index),
-        text = folder.name,
-        help = "Enter saves the name  -  Esc cancels",
-        onSubmit = function(text)
-            text = (text or ""):gsub("[\r\n=]", " "):gsub("^%s+", ""):gsub("%s+$", ""):sub(1, 30)
-            folder.name = text ~= "" and text or DefaultName(folder.index)
-            ApplyLook(folder)
-            RefreshFolderSlots(folder)
-            SaveState()
-            OpenWheel(folder, true)
-        end,
-        onCancel = function() OpenWheel(folder, true) end,
-    })
-end
-
-OpenWheel = function(folder, instant)
-    RefreshSpellIndex(true)
-    local bag = Bag()
-    local options, spells = {}, {}
-    for _, key in ipairs(folder.spells) do
-        local spell = FindSpell(key)
-        if spell then
-            local info = SpellInfo(spell, bag)
-            options[#options + 1] = {
-                name = info.name, description = info.description, icon = info.icon,
-                cost = info.cost, detail = "No cost", cooldown = info.cooldown,
-                status = info.missing and ("Not enough " .. info.missing) or "",
-                statusBad = info.missing ~= nil, disabled = info.missing ~= nil,
-            }
-            spells[#spells + 1] = { key = key, object = spell, name = info.name }
+-- What the open folder's page holds now, as the folder's own slots. A spell the game
+-- doesn't have right now (a missing spell mod) keeps its place unless something else was
+-- put there. Folders can't go inside folders. Returns the slots and how many folders
+-- were left out.
+local function PageAsFolderSlots(arr, view)
+    local page = view.pages[1].page
+    local slots, nested = {}, 0
+    for k = 0, PER_PAGE - 1 do
+        local current = arr[page * PER_PAGE + k + 1]
+        if U.Valid(current) then
+            if ByAddress[U.Addr(current)] then
+                nested = nested + 1
+            else
+                slots[k] = KeyOf(current)
+            end
+        elseif view.unresolved[k] then
+            slots[k] = view.unresolved[k]
         end
     end
-    local hidden = #folder.spells - #spells
-    local hint = "Left click casts a spell. Right click takes it out of the folder. " ..
-                 "To add one, drag it from the Spellbook list (P) onto this folder in the radial."
-    if #spells == 0 then
-        hint = "This folder is empty. Open the Spellbook (P) and drag a spell from the list onto this folder in the radial."
+    return slots, nested
+end
+
+local function SameSlots(a, b)
+    for k = 0, PER_PAGE - 1 do
+        if a[k] ~= b[k] then return false end
     end
-    if hidden > 0 then
-        hint = hint .. " " .. hidden .. " spell(s) in this folder aren't in the game right now (a spell mod may be missing)."
+    return true
+end
+
+-- The radial's title ("SPELLBOOK 1") is a label on each of its page buttons.
+local function TitleLabels(radial)
+    local prefix = U.Valid(radial) and U.FullName(radial):match("^%S+ (.+)$")
+    if not prefix then return {} end
+    prefix = prefix .. "."
+    local list = {}
+    for _, t in ipairs(FindAllOf("TextBlock") or {}) do
+        if U.Valid(t) and U.Name(t) == "LabelText" then
+            local path = U.FullName(t):match("^%S+ (.+)$") or ""
+            if path:sub(1, #prefix) == prefix and path:find(".SpellbookSelector.", 1, true) then list[#list + 1] = t end
+        end
     end
-    UI.Wheel({
-        title = folder.name,
-        hint = hint,
-        emptyText = #spells == 0 and "Empty" or "",
-        options = options,
-        selected = LastPick[folder.index],
-        instant = instant,
-        legend = {
-            { label = "Cast", texture = UI.Input.LeftMouse },
-            { label = "Take out", texture = UI.Input.RightMouse },
-            { label = "Rename", texture = UI.Input.R },
-            { label = "Picture", texture = UI.Input.I },
-            { label = "Close", texture = UI.Input.Esc },
-        },
-        onPick = function(idx)
-            local pick = spells[idx]
-            if not pick then return end
-            LastPick[folder.index] = idx
-            if not U.Valid(pick.object) then return end
-            if not CastSpell(pick.object) then UI.Toast("Spell Folders: the game didn't take the cast.") end
-        end,
-        onRemove = function(idx)
-            local pick = spells[idx]
-            if not pick then return end
-            RemoveFromFolder(folder, pick.key)
-            LastPick[folder.index] = math.max(1, math.min(idx, #spells - 1))
-            OpenWheel(folder, true)
-            UI.Toast(pick.name .. " taken out of " .. folder.name .. ".", 2)
-        end,
-        onKey = function(key)
-            if key == "R" then
-                RenameFolder(folder)
-            elseif key == "I" then
-                folder.icon = folder.icon % #ICONS + 1
-                ApplyLook(folder)
-                RefreshFolderSlots(folder)
-                SaveState()
-                UI.Toast(folder.name .. ": picture " .. folder.icon .. " of " .. #ICONS .. ".", 2)
+    return list
+end
+
+-- Where the hint line goes in the Spellbook: under the radial, left of the game's own
+-- "Remove Spell / Back" line (measured from the screen centre, in interface units).
+local BOOK_HINT_X, BOOK_HINT_Y = 334, 432
+
+-- Shows the open folder's name where the radial shows its page name.
+local function ShowTitle(view)
+    local radial
+    if view.context == "hud" then
+        radial = HudRadial()
+    else
+        local screen = OpenSpellbook()
+        radial = screen and U.Get(screen, "RadialSpellSelector")
+        UI.Hint("Right-click: close the folder     R: rename     I: change its picture", BOOK_HINT_X, BOOK_HINT_Y)
+    end
+    view.titles = {}
+    for _, t in ipairs(TitleLabels(radial)) do
+        local ok, text = pcall(function() return t:GetText():ToString() end)
+        if ok then
+            view.titles[#view.titles + 1] = { widget = t, text = text }
+            pcall(function() t:SetText(FText(view.folder.name)) end)
+        end
+    end
+end
+
+local function RestoreTitle(view)
+    UI.Hint(nil)
+    for _, title in ipairs(view.titles or {}) do
+        local widget, text = title.widget, title.text
+        if U.Valid(widget) then pcall(function() widget:SetText(FText(text)) end) end
+    end
+    view.titles = nil
+end
+
+-- Opens a folder: its spells replace the given radial pages until CloseFolder.
+local function OpenFolder(folder, pages, context)
+    local arr = SelectedSpells()
+    if not arr or #pages == 0 then return false end
+    RefreshSpellIndex(true)
+    local view = { folder = folder, context = context, pages = {}, unresolved = {}, at = os.clock() }
+    local content = {}
+    for k = 0, PER_PAGE - 1 do
+        local key = folder.slots[k]
+        if key then
+            content[k] = FindSpell(key)
+            if not content[k] then view.unresolved[k] = key end
+        end
+    end
+    for _, page in ipairs(pages) do
+        view.pages[#view.pages + 1] = { page = page, original = ReadPage(arr, page) }
+    end
+    for _, p in ipairs(view.pages) do WritePage(arr, p.page, content) end
+    View = view
+    SaveState()
+    RefreshRadials()
+    ShowTitle(view)
+    U.DebugLog("Opened %s (%s).", folder.name, context)
+    return true
+end
+
+-- Closes the open folder: what the player arranged in the Spellbook becomes the folder's
+-- content, and the radial pages get back what they held.
+local function CloseFolder(why)
+    local view = View
+    if not view then return end
+    View = nil
+    RestoreTitle(view)
+    local arr = SelectedSpells()
+    if arr then
+        if view.context == "book" then
+            local slots, nested = PageAsFolderSlots(arr, view)
+            view.folder.slots = slots
+            if nested > 0 then UI.Toast("A folder can't go inside a folder.") end
+        end
+        for _, p in ipairs(view.pages) do WritePage(arr, p.page, p.original) end
+    end
+    ApplyLook(view.folder)
+    SaveState()
+    RefreshRadials()
+    U.DebugLog("Closed %s (%s).", view.folder.name, tostring(why))
+end
+
+local function OpenRadial()
+    local api, pc = MenuApi(), U.PlayerController()
+    if api and pc then U.Call(api, "OpenWidgetIfClosed", pc, WIDGET_RADIAL, false, true) end
+end
+
+-- Runs often while a folder is open.
+local function UpdateView(slow)
+    local view = View
+    if not view then return end
+    local now = os.clock()
+    if view.context == "hud" then
+        local open = IsOpen(WIDGET_RADIAL)
+        if not view.opened then
+            if open then
+                view.opened = now
+                RefreshRadials()
+            elseif now - view.at > 2.5 then
+                CloseFolder("the radial didn't open")
+            elseif now - view.at > 0.2 then
+                OpenRadial()
             end
-        end,
-    })
+        elseif open then
+            view.closed = nil
+        else
+            view.closed = view.closed or now
+            if now - view.closed > 0.15 and not Placing() then CloseFolder("radial closed") end
+        end
+    else
+        local screen = OpenSpellbook()
+        local page = screen and BookState(screen)
+        if not screen or page ~= view.pages[1].page then
+            CloseFolder(screen and "page changed" or "spellbook closed")
+        elseif slow then
+            -- Keep the saved folder in step with what the player has arranged so far.
+            local arr = SelectedSpells()
+            if arr then
+                local slots = PageAsFolderSlots(arr, view)
+                if not SameSlots(slots, view.folder.slots) then
+                    view.folder.slots = slots
+                    SaveState()
+                end
+            end
+        end
+    end
 end
 
 ------------------------------------------------------------------------ watching the game's casts
 
 local NewActors = {}      -- spell actors created since the last tick
-
-local stopped = false
 
 local function OnNewSpellActor(actor)
     if not stopped then NewActors[#NewActors + 1] = actor end
@@ -716,15 +857,22 @@ local function UpdateCasts()
                 local comp = U.Get(actor, "OwningMagicComponent")
                 local owner = U.Valid(comp) and select(2, U.Call(comp, "GetOwner")) or nil
                 if not owner or U.Addr(owner) == World.pawnAddr then
-                    -- Stop the game's cast of the folder itself and open its wheel instead.
+                    -- Stop the game's cast of the folder itself and open the folder instead.
                     local pawn = U.Pawn()
                     local magic = pawn and U.Get(pawn, "PlayerUtilityMagicComponent")
                     if U.Valid(magic) then U.Call(magic, "Server_CancelSpell") end
                     local okAuth, auth = pcall(function() return pawn:HasAuthority() end)
+                    local arr = SelectedSpells()
                     if okAuth and auth == false then
                         UI.Toast("Spell folders only work in your own world.")
+                    elseif View or not arr then
+                        U.DebugLog("Folder cast ignored: another folder is open.")
+                    elseif FolderCount(folder) == 0 then
+                        UI.Toast(folder.name .. " is empty. In the Spellbook (P), right-click it to open it, then drag spells in.", 5)
                     else
-                        OpenWheel(folder, false)
+                        -- The folder was picked from the page the player is on; open it on
+                        -- every page that holds it, so that page is certainly one of them.
+                        OpenFolder(folder, PagesHolding(arr, folder.object), "hud")
                     end
                 end
             end
@@ -748,26 +896,33 @@ local function Snapshot(arr)
     return snap
 end
 
--- A spell dropped onto a folder in the Spellbook goes into the folder.
+-- A spell dropped onto a closed folder in the Spellbook goes into the folder.
 local function AddDropped(folder, spell)
     local key, name = KeyOf(spell), SpellName(spell)
-    if HasSpell(folder, key) then
+    local free = FirstFree(folder)
+    if FolderHas(folder, key) then
         UI.Toast(name .. " is already in " .. folder.name .. ".", 2)
-    elseif #folder.spells >= MAX_SPELLS then
-        UI.Toast(folder.name .. " is full (" .. MAX_SPELLS .. " spells).", 2)
+    elseif not free then
+        UI.Toast(folder.name .. " is full (" .. PER_PAGE .. " spells).", 2)
     else
-        folder.spells[#folder.spells + 1] = key
+        folder.slots[free] = key
         SpellIndex[key] = spell
         ApplyLook(folder)
         UI.Toast(name .. " added to " .. folder.name .. ".", 2)
     end
 end
 
+-- Keeps track of which slots hold folders. Not run while a folder is open (its page
+-- holds the folder's spells then).
 local function TrackRadial()
-    local arr, sc = SelectedSpells()
+    if View then
+        Prev = nil
+        return
+    end
+    local arr = SelectedSpells()
     if not arr then return end
     local now = Snapshot(arr)
-    local changed = false
+    local changed, redraw = false, false
     if Prev and OpenSpellbook() then
         for slot, was in pairs(Prev) do
             local is = now[slot]
@@ -782,9 +937,9 @@ local function TrackRadial()
                 end
                 if not moved then
                     AddDropped(was.folder, is.object)
-                    SetSlot(sc, arr, slot, was.folder.object)
+                    SetSlot(arr, slot, was.folder.object)
                     now[slot] = was
-                    changed = true
+                    changed, redraw = true, true
                 end
             end
         end
@@ -800,6 +955,75 @@ local function TrackRadial()
         World.slots = slots
         SaveState()
     end
+    if redraw then RefreshRadials() end
+end
+
+------------------------------------------------------------------------ keys
+
+-- Set by the key binds (which UE4SS runs outside the game thread) and read by Tick.
+local Pressed = { RIGHT_MOUSE_BUTTON = false, R = false, I = false, ESCAPE = false, RETURN = false }
+
+local function RenameFolder(folder)
+    -- Typing needs the game's menus out of the way: close the Spellbook, ask, open it again.
+    local api, pc = MenuApi(), U.PlayerController()
+    if not (api and pc) then return end
+    U.Call(api, "CloseWidgetIfOpen", pc, WIDGET_SPELLBOOK, false, true)
+    local function Back()
+        U.Call(api, "OpenWidgetIfClosed", pc, WIDGET_SPELLBOOK, false, true)
+    end
+    UI.Prompt({
+        title = "Name this folder",
+        hint = DefaultName(folder.index),
+        text = folder.name,
+        help = "Enter saves the name  -  Esc cancels",
+        onSubmit = function(text)
+            text = (text or ""):gsub("[\r\n=|]", " "):gsub("^%s+", ""):gsub("%s+$", ""):sub(1, 30)
+            folder.name = text ~= "" and text or DefaultName(folder.index)
+            ApplyLook(folder)
+            SaveState()
+            Back()
+        end,
+        onCancel = Back,
+    })
+end
+
+-- Right-click in the Spellbook: opens the folder under the mouse, or closes the open one.
+local function OnRightClick()
+    local screen = OpenSpellbook()
+    if not screen or UI.IsOpen() then return end
+    if View then
+        if View.context == "book" then CloseFolder("right-click") end
+        return
+    end
+    local page, slice = BookState(screen)
+    local arr = SelectedSpells()
+    if not (arr and page and slice) then return end
+    local current = arr[page * PER_PAGE + slice + 1]
+    local folder = U.Valid(current) and ByAddress[U.Addr(current)]
+    if folder then OpenFolder(folder, { page }, "book") end
+end
+
+local function UpdateKeys()
+    local right, r, i = Pressed.RIGHT_MOUSE_BUTTON, Pressed.R, Pressed.I
+    local esc, enter = Pressed.ESCAPE, Pressed.RETURN
+    Pressed.RIGHT_MOUSE_BUTTON, Pressed.R, Pressed.I, Pressed.ESCAPE, Pressed.RETURN = false, false, false, false, false
+    if UI.IsOpen() then
+        if esc then UI.Key("ESCAPE") elseif enter then UI.Key("RETURN") end
+        return
+    end
+    if right then OnRightClick() end
+    if View and View.context == "book" then
+        local folder = View.folder
+        if i then
+            folder.icon = folder.icon % #ICONS + 1
+            ApplyLook(folder)
+            SaveState()
+            UI.Toast(folder.name .. ": picture " .. folder.icon .. " of " .. #ICONS .. ".", 2)
+        elseif r then
+            CloseFolder("rename")
+            RenameFolder(folder)
+        end
+    end
 end
 
 ------------------------------------------------------------------------ the player's world
@@ -811,7 +1035,9 @@ local function UpdateWorld()
         World.pawnAddr = addr
         World.restored = false
         World.restoreAt = pawn and (os.clock() + 2.5) or nil
-        Prev = nil
+        -- An open folder's page is put back from the saved file on the next load.
+        if View then RestoreTitle(View) end
+        Prev, View = nil, nil
         UI.Close()
     end
     if not pawn or not Ready then return false end
@@ -819,15 +1045,17 @@ local function UpdateWorld()
         if os.clock() < (World.restoreAt or 0) then return false end
         local key = CharacterKey()
         World.file = MOD_FOLDER .. "saved_" .. key .. ".txt"
-        World.slots = LoadState(World.file)
+        World.slots, World.pending = LoadState(World.file)
         RefreshSpellIndex(true)
         for _, folder in ipairs(Folders) do ApplyLook(folder) end
         ClearStaleFolders()
-        if UnlockFolders() and RestoreSlots() then
+        if RestoreSlots() and UnlockFolders() and RestoreSlots() then
             World.restored = true
             -- The game may place the unlocked folders a moment later; keep cleaning for a few seconds.
             World.cleanUntil = os.clock() + 5
             CleanRadial()
+            SaveState()
+            RefreshRadials()
             U.DebugLog("Character %s: folders unlocked and radial restored.", key)
         end
         return false
@@ -849,12 +1077,19 @@ local worldReady = false
 local function Tick()
     if stopped then return end
     tickCount = tickCount + 1
+    local slow = tickCount % 5 == 0
     UI.Tick()
     if not Ready then return end
-    UpdateCasts()
-    if tickCount % 5 == 0 then
+    if slow then
         worldReady = UpdateWorld()
-        if worldReady then TrackRadial() end
+        if not hooked and tickCount % 100 == 0 then HookPlacement() end
+    end
+    if not worldReady then return end
+    UpdateKeys()
+    UpdateCasts()
+    UpdateView(slow)
+    if slow then
+        TrackRadial()
         UpdateSpellbook()
     end
 end
@@ -875,6 +1110,7 @@ local function TryStart()
     local ok, n = pcall(function() return sub.NetIdToData:GetArrayNum() end)
     if not ok or n == 0 then return false end
     CreateAll()
+    HookPlacement()
     return true
 end
 
@@ -895,13 +1131,11 @@ end)
 
 pcall(NotifyOnNewObject, "/Script/Dominion.DominionSpellActor", OnNewSpellActor)
 
-for _, name in ipairs(UI.Keys) do
+for name in pairs(Pressed) do
     local key = Key[name]
     if key then
         RegisterKeyBind(key, function()
-            if UI.IsOpen() and not stopped then
-                ExecuteInGameThread(function() UI.Key(UI.KeyAlias[name] or name) end)
-            end
+            if not stopped then Pressed[name] = true end
         end)
     end
 end
@@ -910,16 +1144,30 @@ end
 function SpellFoldersStatus()
     local parts = {}
     for i, folder in ipairs(Folders) do
-        parts[#parts + 1] = string.format("%d:%s[%s]", i, folder.name, table.concat(folder.spells, ","))
+        local keys = {}
+        for k = 0, PER_PAGE - 1 do
+            if folder.slots[k] then keys[#keys + 1] = k .. ":" .. folder.slots[k] end
+        end
+        if #keys > 0 or folder.name ~= DefaultName(i) then
+            parts[#parts + 1] = string.format("%d:%s[%s]", i, folder.name, table.concat(keys, ","))
+        end
     end
     local slots = {}
     for slot, idx in pairs(World.slots) do slots[#slots + 1] = slot .. "=" .. idx end
     table.sort(slots)
-    return string.format("ready=%s restored=%s ui=%s slots{%s} %s", tostring(Ready), tostring(World.restored),
-        tostring(UI.IsOpen()), table.concat(slots, " "), table.concat(parts, " "))
+    local view = "none"
+    if View then
+        local pages = {}
+        for _, p in ipairs(View.pages) do pages[#pages + 1] = p.page end
+        view = string.format("%s:%d@%s%s", View.context, View.folder.index, table.concat(pages, "+"), View.opened and "" or "(opening)")
+    end
+    return string.format("ready=%s restored=%s view=%s placing=%d prompt=%s slots{%s} %s", tostring(Ready), tostring(World.restored),
+        view, placing, tostring(UI.IsOpen()), table.concat(slots, " "), table.concat(parts, " "))
 end
 function SpellFoldersStop()
+    if View then pcall(CloseFolder, "mod stopped") end
     stopped = true
+    UI.Hint(nil)
     UI.Close()
 end
 
