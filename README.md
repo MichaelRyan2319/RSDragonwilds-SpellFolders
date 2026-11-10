@@ -1,11 +1,12 @@
 # Spell Folders for RuneScape: Dragonwilds
 
 A UE4SS Lua mod for RuneScape: Dragonwilds that adds folders to the spell
-radial. A folder takes one radial slot and holds up to 12 spells of its own,
+radial. A folder takes one radial slot and holds up to 11 spells of its own,
 so you can keep many more spells within reach.
 
-- Pick a folder in the spell radial (**Q**) and the radial opens again showing
-  the folder's spells. Pick one and the game casts it.
+- Pick a folder in the spell radial (**Q**) and the radial switches to the
+  folder's spells straight away. Pick one and the game casts it. The bottom
+  slot (7) of every folder is a **Back** button to your own spells.
 - A folder is shown by the game's own radial, so it looks and handles exactly
   like a normal page: the same pointer, number keys, rune costs, cooldowns,
   aiming and placing.
@@ -80,9 +81,13 @@ A quicker way to add one spell: drag it from the list onto a closed folder.
 (Don't right-click a folder to open it: in the game, a right-click takes a
 spell out of its slot.)
 
-**Cast from a folder.** Press **Q**, pick the folder, and the radial opens again
-with the folder's spells. Pick a spell to cast it, or close the radial to cast
+**Cast from a folder.** Press **Q**, pick the folder, and the radial switches to
+the folder's spells. Pick a spell to cast it, or close the radial to cast
 nothing. Your normal page is back the next time you open the radial.
+
+The bottom slot of an open folder (slot 7, so the **7** key works too) is a
+**Back** button: it takes you straight back to your own spells with the radial
+still open. That slot is reserved in every folder, so a folder holds 11 spells.
 
 Pressing **P** while a folder is open in the radial opens the Spellbook on that
 folder, ready to arrange.
@@ -97,6 +102,8 @@ the game.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `Folders` | `8` | How many folders the Spellbook offers (1 to 24) |
+| `BackButton` | `true` | The bottom slot of an open folder is a Back button; `false` gives folders 12 spells and no button |
+| `BackIcon` | an arrow | Texture for the Back button |
 | `CategoryName` | `"SPELL FOLDERS"` | Name of the Spellbook category |
 | `CategoryIcon` | `""` | Texture for that category; empty uses the Magic skill's icon |
 | `DebugLogging` | `false` | More detail in the log |

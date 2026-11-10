@@ -7,7 +7,8 @@
       * Folders are listed in the Spellbook (P) under "Spell Folders". Drag one into a
         radial slot like a spell.
       * Pick a folder in the radial and the radial opens again showing the folder's
-        spells. Pick one and the game casts it.
+        spells. Pick one and the game casts it. The bottom slot (7) of a folder is a
+        Back button that takes you back to your own spells.
       * In the Spellbook, point at a folder in the radial and press O to open it. The
         radial then shows the folder's spells and you arrange them like any page: drag
         spells in from the list, drag them between slots, remove them. O again goes
@@ -35,6 +36,8 @@ local UI = require("folders.ui")
 
 local Defaults = {
     Folders = 8,
+    BackButton = true,                 -- the bottom slot of an open folder goes back to your spells
+    BackIcon = "/Game/Art/UI/MainMenu/CharacterSelect/T_Arrow_L",
     CategoryName = "SPELL FOLDERS",
     CategoryIcon = "",                 -- texture path; empty = the Magic skill's icon
     AliasSpell = "/Game/Gameplay/UtilityMagic/WorldInteractionSpells/USD_SiphonRunes",
@@ -56,6 +59,7 @@ Config.Folders = math.max(1, math.min(24, math.floor(tonumber(Config.Folders) or
 
 local MOD_FOLDER = U.ModFolder()
 local PER_PAGE = 12          -- slots on one page of the game's radial
+local BACK_SLOT = 6          -- the bottom slot (the radial numbers it 7)
 local WIDGET_RADIAL = 21     -- EWidgetType::Spellcasting (the radial on the HUD)
 local WIDGET_SPELLBOOK = 20  -- EWidgetType::SpellBook
 
@@ -110,6 +114,14 @@ local World = {
 -- { folder, context = "hud" | "book", pages = { { page, original = { [k] = object } } },
 --   unresolved = { [k] = key }, at, opened, closed }
 local View = nil
+
+-- The Back button: one more copied spell with no effect, shown in the bottom slot of an
+-- open folder. { object, perk, addr }
+local Back = nil
+
+local function IsBack(object)
+    return Back ~= nil and U.Valid(object) and U.Addr(object) == Back.addr
+end
 
 local function DefaultName(i) return "Folder " .. i end
 local function DefaultIcon(i) return (i - 1) % #ICONS + 1 end
@@ -184,7 +196,7 @@ end
 
 local function FirstFree(folder)
     for k = 0, PER_PAGE - 1 do
-        if not folder.slots[k] then return k end
+        if not folder.slots[k] and not (Config.BackButton and k == BACK_SLOT) then return k end
     end
     return nil
 end
@@ -244,44 +256,43 @@ local function ApplyLook(folder)
     end
 end
 
-local function CreateFolder(i, template)
-    local spell = U.Clone(template, nil, "USD_SpellFolder_" .. i)
+-- A copy of the base spell that does nothing when cast, known to the game's spell data
+-- like a spell loaded from the game's files. Returns the spell and its Spellbook entry (perk).
+local function NewRadialObject(template, internalName, objectName)
+    local spell = U.Clone(template, nil, "USD_" .. objectName)
     if not spell then return nil end
-    local folder = { index = i, object = spell, name = DefaultName(i), icon = DefaultIcon(i), slots = {} }
     StripModules(spell)
     U.Set(spell, "PersistenceID", AliasId)
-    U.Set(spell, "InternalName", "spellfolder_" .. i)
+    U.Set(spell, "InternalName", internalName)
     U.Set(spell, "CooldownDuration", 0.0)
     U.Set(spell, "SpecialRequirementsStrategy", nil)
     U.Set(spell, "bNeedsUnlocking", true)
     U.Set(spell, "CastType", 0)
-    -- No skill tag (the base spell's little pickaxe) next to the folder's picture.
+    -- No skill tag (the base spell's little pickaxe) next to the picture.
     pcall(function()
         local lib = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
         spell.SpellTagIcon = lib:Conv_SoftObjPathToSoftObjRef(lib:MakeSoftObjectPath(""))
     end)
 
+    local perk = nil
     local perkTemplate = U.Get(template, "OwningPerk")
     if U.Valid(perkTemplate) then
-        local perk = U.Clone(perkTemplate, nil, "PERK_SpellFolder_" .. i)
+        perk = U.Clone(perkTemplate, nil, "PERK_" .. objectName)
         if perk then
             U.Set(perk, "PersistenceID", "")
-            U.Set(perk, "InternalName", "perk_spellfolder_" .. i)
+            U.Set(perk, "InternalName", "perk_" .. internalName)
             local mods = U.Get(perk, "PerkModules")
             for j = 1, (mods and mods:GetArrayNum() or 0) do
                 local m = mods[j]
                 if U.Valid(m) and U.Get(m, "SpellData") ~= nil then U.Set(m, "SpellData", spell) end
             end
-            folder.perk = perk
         end
     end
-    U.Set(spell, "OwningPerk", folder.perk)
-    ApplyLook(folder)
+    U.Set(spell, "OwningPerk", perk)
 
-    -- Make the game's spell data know the folder, like a spell loaded from the game's files.
     local sub = FindFirstOf("UtilitySpellDataSubsystem")
     if not U.Valid(sub) then return nil end
-    pcall(function() sub.InternalNameToDataMap:Add("spellfolder_" .. i, spell) end)
+    pcall(function() sub.InternalNameToDataMap:Add(internalName, spell) end)
     pcall(function() sub.AssetNameToDataMap:Add(U.Name(spell), spell) end)
     local ok = pcall(function()
         local n = sub.NetIdToData:GetArrayNum()
@@ -289,7 +300,30 @@ local function CreateFolder(i, template)
         sub.DataToNetIdMap:Add(spell, { NetId = n })
     end)
     if not ok then return nil end
+    return spell, perk
+end
+
+local function CreateFolder(i, template)
+    local spell, perk = NewRadialObject(template, "spellfolder_" .. i, "SpellFolder_" .. i)
+    if not spell then return nil end
+    local folder = { index = i, object = spell, perk = perk, name = DefaultName(i), icon = DefaultIcon(i), slots = {} }
+    ApplyLook(folder)
     return folder
+end
+
+local function CreateBack(template)
+    local spell, perk = NewRadialObject(template, "spellfolder_back", "SpellFolder_Back")
+    if not spell then return nil end
+    local name, text = "Back", "Back to your own spells."
+    local icon = U.Soft(Config.BackIcon)
+    U.Set(spell, "SpellDisplayName", FText(name))
+    if icon then U.Set(spell, "SpellIcon", icon) end
+    if U.Valid(perk) then
+        U.Set(perk, "PerkName", FText(name))
+        U.Set(perk, "PerkDescription", FText(text))
+        if icon then U.Set(perk, "SkillPerkImage", icon) end
+    end
+    return { object = spell, perk = perk, addr = U.Addr(spell) }
 end
 
 local function CreateAll()
@@ -312,6 +346,14 @@ local function CreateAll()
             ByAddress[U.Addr(folder.object)] = folder
         else
             U.Log("Folder %d could not be created: %s", i, tostring(folder))
+        end
+    end
+    if Config.BackButton then
+        local ok, back = pcall(CreateBack, template)
+        if ok and back then
+            Back = back
+        else
+            U.Log("The Back button could not be created: %s", tostring(back))
         end
     end
     UI.RemoveLeftovers()
@@ -533,10 +575,12 @@ end
 local function UnlockFolders()
     local prog = U.OwnedComponent("ProgressComponent", U.PlayerController())
     if not prog then return false end
-    local list = {}
-    for _, folder in ipairs(Folders) do
-        local ok, unlocked = U.Call(prog, "IsSpellUnlocked", folder.object)
-        if not (ok and unlocked) then list[#list + 1] = folder.object end
+    local list, objects = {}, {}
+    for _, folder in ipairs(Folders) do objects[#objects + 1] = folder.object end
+    if Back then objects[#objects + 1] = Back.object end
+    for _, object in ipairs(objects) do
+        local ok, unlocked = U.Call(prog, "IsSpellUnlocked", object)
+        if not (ok and unlocked) then list[#list + 1] = object end
     end
     if #list > 0 then U.Call(prog, "UnlockSpells", list) end
     return true
@@ -580,7 +624,8 @@ local function ClearStaleFolders()
     if not arr then return end
     for i = 1, arr:GetArrayNum() do
         local sp = arr[i]
-        if U.Valid(sp) and not ByAddress[U.Addr(sp)] and U.Str(U.Get(sp, "InternalName")):match("^spellfolder_%d+$") then
+        if U.Valid(sp) and not ByAddress[U.Addr(sp)] and not IsBack(sp)
+            and U.Str(U.Get(sp, "InternalName")):match("^spellfolder_") then
             SetSlot(arr, i - 1, nil)
         end
     end
@@ -588,14 +633,15 @@ end
 
 -- Unlocking a spell makes the game put it into the first empty radial slot, and the
 -- folders are unlocked again on every load. This empties every slot that holds a folder
--- the player didn't put there. Returns how many slots were emptied.
+-- the player didn't put there, or the Back button (which only belongs in an open folder).
+-- Returns how many slots were emptied. Not for use while a folder is open.
 local function CleanRadial()
     local arr = SelectedSpells()
     if not arr then return 0 end
     local removed = 0
     for i = 1, arr:GetArrayNum() do
         local folder = ByAddress[U.Addr(arr[i])]
-        if folder and World.slots[i - 1] ~= folder.index then
+        if (folder and World.slots[i - 1] ~= folder.index) or IsBack(arr[i]) then
             SetSlot(arr, i - 1, nil)
             removed = removed + 1
         end
@@ -697,7 +743,9 @@ local function PageAsFolderSlots(arr, view)
     local slots, nested = {}, 0
     for k = 0, PER_PAGE - 1 do
         local current = arr[page * PER_PAGE + k + 1]
-        if U.Valid(current) then
+        if IsBack(current) then
+            -- not one of the folder's spells
+        elseif U.Valid(current) then
             if ByAddress[U.Addr(current)] then
                 nested = nested + 1
             else
@@ -708,6 +756,38 @@ local function PageAsFolderSlots(arr, view)
         end
     end
     return slots, nested
+end
+
+-- In the Spellbook the player can drag things onto or off the Back button's slot. This puts
+-- the button back: a spell dropped on it moves to the first free slot (or is left out if
+-- the folder is full). Returns whether anything was changed.
+local function KeepBackInPlace(arr, view)
+    if not view.back then return false end
+    local base = view.pages[1].page * PER_PAGE
+    local changed = false
+    for k = 0, PER_PAGE - 1 do
+        if k ~= BACK_SLOT and IsBack(arr[base + k + 1]) then
+            SetSlot(arr, base + k, nil)
+            changed = true
+        end
+    end
+    local at = arr[base + BACK_SLOT + 1]
+    if not IsBack(at) then
+        if U.Valid(at) then
+            local free = nil
+            for k = 0, PER_PAGE - 1 do
+                if not free and k ~= BACK_SLOT and not U.Valid(arr[base + k + 1]) then free = k end
+            end
+            if free then
+                SetSlot(arr, base + free, at)
+            else
+                UI.Toast("This folder is full (slot 7 is its Back button).", 3)
+            end
+        end
+        SetSlot(arr, base + BACK_SLOT, Back.object)
+        changed = true
+    end
+    return changed
 end
 
 local function SameSlots(a, b)
@@ -783,6 +863,15 @@ local function OpenFolder(folder, pages, context)
     if not arr or #pages == 0 then return false end
     RefreshSpellIndex(true)
     local view = { folder = folder, context = context, pages = {}, unresolved = {}, at = os.clock() }
+    -- The Back button takes the bottom slot. A spell an older version put there moves to a
+    -- free slot; only a folder with all twelve slots used goes without the button.
+    if Back and folder.slots[BACK_SLOT] then
+        local free = FirstFree(folder)
+        if free then
+            folder.slots[free], folder.slots[BACK_SLOT] = folder.slots[BACK_SLOT], nil
+        end
+    end
+    view.back = Back ~= nil and not folder.slots[BACK_SLOT]
     local content = {}
     for k = 0, PER_PAGE - 1 do
         local key = folder.slots[k]
@@ -791,6 +880,7 @@ local function OpenFolder(folder, pages, context)
             if not content[k] then view.unresolved[k] = key end
         end
     end
+    if view.back then content[BACK_SLOT] = Back.object end
     for _, page in ipairs(pages) do
         view.pages[#view.pages + 1] = { page = page, original = ReadPage(arr, page) }
     end
@@ -814,6 +904,7 @@ local function CloseFolder(why)
     local arr = SelectedSpells()
     if arr then
         if view.context == "book" then
+            KeepBackInPlace(arr, view)
             local slots, nested = PageAsFolderSlots(arr, view)
             view.folder.slots = slots
             if nested > 0 then UI.Toast("A folder can't go inside a folder.") end
@@ -873,6 +964,32 @@ NormalFade = function(view)
     if U.Valid(anim) then U.Call(panel, "SetPlaybackSpeed", anim, 1.0) end
 end
 
+-- After the Back button: the radial is opened again on the player's own spells.
+-- { at, asked, opened, fast }
+local Reopen = nil
+
+local function UpdateReopen()
+    local r = Reopen
+    if not r then return end
+    local now = os.clock()
+    if IsOpen(WIDGET_RADIAL) then
+        if not r.opened then
+            r.opened = now
+            RefreshRadials()
+        end
+        if not r.fast or now - r.opened > 0.5 then
+            if r.fast then NormalFade(r) end
+            Reopen = nil
+        end
+    elseif r.opened or now - r.at > 2 then
+        if r.fast then NormalFade(r) end
+        Reopen = nil
+    elseif now - (r.asked or 0) > 0.3 then
+        r.asked = now
+        OpenRadial(r)
+    end
+end
+
 -- Runs often while a folder is open.
 local function UpdateView(slow)
     local view = View
@@ -914,6 +1031,7 @@ local function UpdateView(slow)
             -- Keep the saved folder in step with what the player has arranged so far.
             local arr = SelectedSpells()
             if arr then
+                if KeepBackInPlace(arr, view) then RefreshRadials() end
                 local slots = PageAsFolderSlots(arr, view)
                 if not SameSlots(slots, view.folder.slots) then
                     view.folder.slots = slots
@@ -940,7 +1058,14 @@ local function UpdateCasts()
         if U.Valid(actor) then
             local data = U.Get(actor, "Data")
             local folder = U.Valid(data) and ByAddress[U.Addr(data)]
-            if folder then
+            if IsBack(data) then
+                -- The Back button: stop its cast, close the folder, show the player's own spells.
+                local pawn = U.Pawn()
+                local magic = pawn and U.Get(pawn, "PlayerUtilityMagicComponent")
+                if U.Valid(magic) then U.Call(magic, "Server_CancelSpell") end
+                if View then CloseFolder("back") end
+                Reopen = { at = os.clock() }
+            elseif folder then
                 local comp = U.Get(actor, "OwningMagicComponent")
                 local owner = U.Valid(comp) and select(2, U.Call(comp, "GetOwner")) or nil
                 if not owner or U.Addr(owner) == World.pawnAddr then
@@ -991,7 +1116,7 @@ local function AddDropped(folder, spell)
     if FolderHas(folder, key) then
         UI.Toast(name .. " is already in " .. folder.name .. ".", 2)
     elseif not free then
-        UI.Toast(folder.name .. " is full (" .. PER_PAGE .. " spells).", 2)
+        UI.Toast(folder.name .. " is full.", 2)
     else
         folder.slots[free] = key
         SpellIndex[key] = spell
@@ -1009,8 +1134,16 @@ local function TrackRadial()
     end
     local arr = SelectedSpells()
     if not arr then return end
-    local now = Snapshot(arr)
     local changed, redraw = false, false
+    if Back then
+        for i = 1, arr:GetArrayNum() do
+            if IsBack(arr[i]) then
+                SetSlot(arr, i - 1, nil)
+                redraw = true
+            end
+        end
+    end
+    local now = Snapshot(arr)
     if Prev and OpenSpellbook() then
         for slot, was in pairs(Prev) do
             local is = now[slot]
@@ -1132,7 +1265,7 @@ local function UpdateWorld()
         World.restoreAt = pawn and (os.clock() + 2.5) or nil
         -- An open folder's page is put back from the saved file on the next load.
         if View then RestoreTitle(View) end
-        Prev, View = nil, nil
+        Prev, View, Reopen = nil, nil, nil
         UI.Close()
     end
     if not pawn or not Ready then return false end
@@ -1193,6 +1326,7 @@ local function Tick()
     if not worldReady then return end
     UpdateKeys()
     UpdateCasts()
+    UpdateReopen()
     UpdateView(slow)
     if slow then
         TrackRadial()
