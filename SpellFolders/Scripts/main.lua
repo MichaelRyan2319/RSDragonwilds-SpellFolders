@@ -487,7 +487,12 @@ local function RefreshRadials()
     end
     local screen = OpenSpellbook()
     local radial = screen and U.Get(screen, "RadialSpellSelector")
-    if U.Valid(radial) then U.Call(radial, "RefreshAllSlices") end
+    if U.Valid(radial) then
+        U.Call(radial, "RefreshAllSlices")
+        -- The name and description in the middle belong to the slot the mouse was already
+        -- over. Forgetting that slot makes the radial look at it again.
+        U.Set(radial, "CachedSectionId", 255)
+    end
 end
 
 local function SetSlot(arr, slot, spell)
@@ -672,6 +677,13 @@ local function HookPlacement()
 end
 
 local function Placing()
+    if not hooked then
+        -- Without the hooks, look for the placement actor itself.
+        for _, actor in ipairs(FindAllOf("UtilitySpellPlacementVisualizer") or {}) do
+            if U.Valid(actor) and not IsTemplate(actor) then return true end
+        end
+        return false
+    end
     if placing > 0 and os.clock() - placingSince > 120 then placing = 0 end
     return placing > 0
 end
@@ -867,7 +879,8 @@ local function UpdateView(slow)
                 MoveViewToSpellbook(view, screen)
             elseif IsOpen(WIDGET_SPELLBOOK) and now - view.closed < 2 then
                 -- the Spellbook is on its way up
-            elseif now - view.closed > 0.15 and not Placing() then
+            elseif now - view.closed > 0.5 and not Placing() then
+                -- (Half a second, so a Spellbook opened from the radial is seen first.)
                 CloseFolder("radial closed")
             end
         end
@@ -1220,7 +1233,8 @@ function SpellFoldersStatus()
     if View then
         local pages = {}
         for _, p in ipairs(View.pages) do pages[#pages + 1] = p.page end
-        view = string.format("%s:%d@%s%s", View.context, View.folder.index, table.concat(pages, "+"), View.opened and "" or "(opening)")
+        view = string.format("%s:%d@%s%s", View.context, View.folder.index, table.concat(pages, "+"),
+            (View.opened or View.context == "book") and "" or "(opening)")
     end
     return string.format("ready=%s restored=%s view=%s placing=%d prompt=%s slots{%s} %s", tostring(Ready), tostring(World.restored),
         view, placing, tostring(UI.IsOpen()), table.concat(slots, " "), table.concat(parts, " "))
