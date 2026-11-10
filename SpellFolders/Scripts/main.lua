@@ -1405,6 +1405,20 @@ function SpellFoldersStatus()
     return string.format("ready=%s restored=%s view=%s placing=%d prompt=%s slots{%s} %s", tostring(Ready), tostring(World.restored),
         view, placing, tostring(UI.IsOpen()), table.concat(slots, " "), table.concat(parts, " "))
 end
+-- For testing from the UE4SS console: SpellFoldersDev("press", "O") acts as a press of one of
+-- the mod's keys, SpellFoldersDev("open", 4) opens folder 4 in the open Spellbook.
+function SpellFoldersDev(what, arg)
+    if what == "press" and Pressed[arg] ~= nil then
+        Pressed[arg] = true
+        return true
+    elseif what == "open" then
+        local screen, folder = OpenSpellbook(), Folders[tonumber(arg) or 0]
+        local page = screen and BookState(screen)
+        if not (screen and folder and page) or View then return false end
+        return OpenFolder(folder, { page }, "book")
+    end
+    return false
+end
 function SpellFoldersStop()
     if View then pcall(CloseFolder, "mod stopped") end
     stopped = true
