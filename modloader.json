@@ -1,0 +1,5 @@
+{
+  "requires": [
+    {"repo": "MichaelRyan2319/RSDragonwilds-UE4SS", "name": "UE4SS"}
+  ]
+}
